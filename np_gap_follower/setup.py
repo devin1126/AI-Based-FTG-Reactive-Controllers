@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'gap_follow_node = np_gap_follower.gap_follow_node:main',
+            'np_prior_trainer_node = np_gap_follower.np_prior_trainer:main',
         ],
     },
 )

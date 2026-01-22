@@ -5,7 +5,7 @@ import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
-from np_gap_follower.np_model_structure import AttLNP
+from np_gap_follower.np_model_structure import AttLNP, PriorMLP
 from np_gap_follower.np_model_utils import (
     train_np_model, 
     compute_control_prior,
@@ -38,7 +38,7 @@ class NPGapFollower(Node):
         self.declare_parameter('gap_dim', 256)
         self.declare_parameter('vel_dim', 2)
         self.declare_parameter('vel_embed_dim', 32)
-        self.declare_parameter('enable_ode_model',False)
+        self.declare_parameter('enable_ode_model',True)
         self.gap_dim = self.get_parameter('gap_dim').value
         self.vel_dim = self.get_parameter('vel_dim').value
         self.vel_embed_dim = self.get_parameter('vel_embed_dim').value
@@ -51,7 +51,7 @@ class NPGapFollower(Node):
                             device='cpu')
 
         # Load pre-trained weights (paths can be parameterized as needed)
-        self.declare_parameter('model_weights_path', '/home/devin1126/cavrel_racer/racer_ws/src/np_gap_follower/np_gap_follower/attnp_model_weights_updated.pth')   # Enter path to pre-trained model weights to enable INFERENCE mode
+        self.declare_parameter('model_weights_path', '/home/devin1126/cavrel_racer/racer_ws/src/np_gap_follower/np_gap_follower/pinp_model_weights_updated.pth')   # Enter path to pre-trained model weights to enable INFERENCE mode
         np_weights_path = self.get_parameter('model_weights_path').value
         if np_weights_path:
             self.get_logger().info(f'NP Gap Follower Node initialized in INFERENCE mode.')
@@ -71,6 +71,22 @@ class NPGapFollower(Node):
         # --- Optimizer and Loss Function ---
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.loss_function = ELBO()
+
+
+        # --- Pre-Trained Prior Model Initialization (for PI model control prior) ---
+        if self.enable_ode_model:
+            self.prior_model = PriorMLP(in_dim=self.vel_dim + 2,  # max_gap_angle + d_max + (v,w)
+                                        hidden_dim=64)
+            
+            # Load pre-trained prior model weights
+            self.declare_parameter('prior_model_weights_path', '/home/devin1126/cavrel_racer/racer_ws/src/np_gap_follower/np_gap_follower/prior_mlp_weights_updated.pth')
+            prior_weights_path = self.get_parameter('prior_model_weights_path').value
+            if prior_weights_path:
+                self.prior_model.load_state_dict(torch.load(prior_weights_path))
+                self.prior_model.eval()
+                self.get_logger().info("Prior MLP model weights loaded successfully.")
+            else:
+                self.get_logger().error("Prior model weights path not provided; PI model cannot compute control prior.")
 
         # --- ROS2 Subscribers and Publisher ---
         self.drive_sub = self.create_subscription(
@@ -135,8 +151,11 @@ class NPGapFollower(Node):
         self.delta_rate_array = []
 
         # Loop timer for performance monitoring
-        self.ftg_timer = LoopTimerROS(self, window=5000, report_period=25.0)
-        self.cbf_timer = LoopTimerROS(self, window=5000, report_period=30.0)
+        self.declare_parameter('log_times', False)
+        self.log_times = self.get_parameter('log_times').value
+        if self.log_times:
+            self.ftg_timer = LoopTimerROS(self, window=5000, report_period=25.0)
+            self.cbf_timer = LoopTimerROS(self, window=5000, report_period=30.0)
 
 
     # Callback function to process drive commands
@@ -199,7 +218,7 @@ class NPGapFollower(Node):
         scan_tensor = torch.tensor(forward_ranges, dtype=torch.float32)
 
         # Get condensed distance readings
-        gap_msg, max_gap_angle = bin_laser_scans(scan_tensor, num_bins=self.gap_dim, max_range=self.max_lidar_dist)
+        gap_msg, max_gap_angle, d_max = bin_laser_scans(scan_tensor, num_bins=self.gap_dim, max_range=self.max_lidar_dist)
 
         """Process learned gap data and publish drive commands"""
         if self.train_mode:
@@ -218,10 +237,7 @@ class NPGapFollower(Node):
             tensor2 = torch.cat((gap_msg, 
                                  torch.tensor([self.odom_msg.twist.twist.linear.x, 
                                                self.odom_msg.twist.twist.angular.z,
-                                               self.drive_label.drive.steering_angle])), dim=0).unsqueeze(0)
-
-            #self.get_logger().info(f'Prev Max Angle: {self.prev_max_angle.unsqueeze(0).shape}, Current Max Angle: {max_gap_angle.unsqueeze(0).shape}')
-            tensor3 = torch.cat((self.prev_max_angle.unsqueeze(0), max_gap_angle.unsqueeze(0) / self.angle_magnitude), dim=1).unsqueeze(-1)    
+                                               self.drive_label.drive.steering_angle])), dim=0).unsqueeze(0)  
         else:
             if self.prev_gap is None or self.prev_linear_velocity is None \
                   or self.prev_angular_velocity is None or self.prev_max_angle is None:
@@ -239,12 +255,26 @@ class NPGapFollower(Node):
                                  torch.tensor([self.odom_msg.twist.twist.linear.x, 
                                                self.odom_msg.twist.twist.angular.z,
                                                0.0])), dim=0).unsqueeze(0)
-            #self.get_logger().info(f'Prev Max Angle: {self.prev_max_angle.shape}, Current Max Angle: {max_gap_angle.shape}')
-            tensor3 = torch.cat((self.prev_max_angle.unsqueeze(0), max_gap_angle.unsqueeze(0) / self.angle_magnitude), dim=1).unsqueeze(-1)
+              
+
+
+        # Predict a priori next steering angle using learned prior model
+        with torch.no_grad():
+            pred_steer = self.prior_model(torch.cat((
+                    max_gap_angle.unsqueeze(0) / self.angle_magnitude,
+                    d_max[None, None], # For size [1,1]
+                    torch.tensor([self.odom_msg.twist.twist.linear.x / 5.0, 
+                                self.odom_msg.twist.twist.angular.z / 5.0]).unsqueeze(0)
+                ), dim=1))
+            
+        pred_steer = torch.cat((
+                        torch.tensor([self.prev_steering_angle]).unsqueeze(0),
+                        pred_steer
+                    ), dim=1).unsqueeze(-1)    
 
         # Creating new sample and adding to replay buffer (if in TRAINING mode)
-        sample = torch.cat((tensor1.unsqueeze(1), tensor2.unsqueeze(1)), dim=1) 
-        sample = torch.cat((sample, tensor3), dim=-1)  # Append max gap angle info
+        sample = torch.cat((tensor1.unsqueeze(1), tensor2.unsqueeze(1)), dim=1) # Shape: [1, 2, input_dim + 1]
+        sample = torch.cat((sample, pred_steer), dim=-1)  # Append predicted steering angle sequence
 
         if self.train_mode: self.replay_buffer.append(sample)
 
@@ -267,8 +297,8 @@ class NPGapFollower(Node):
         if self.enable_ode_model:
             #pred_control = sample[:,:,input_dim+1:].clone()  # Max gap angle as control prior
             #print(f'Pred Control Shape: {pred_control.shape}')
-            pred_control = compute_control_prior(scan_msg.ranges, prev_steering_angle=self.prev_steering_angle)
-            pred_y, var = self.model(query, pred_control=pred_control, is_testing=True)
+            #pred_control = compute_control_prior(scan_msg.ranges, prev_steering_angle=self.prev_steering_angle)
+            pred_y, var = self.model(query, pred_control=pred_steer, is_testing=True)
         else:
             pred_y, var = self.model(query, is_testing=True)
 
@@ -321,7 +351,7 @@ class NPGapFollower(Node):
             )
 
             t3 = self.get_clock().now()
-            self.cbf_timer.push_time_pair(t2, t3)
+            if self.log_times: self.cbf_timer.push_time_pair(t2, t3)
 
         # Determine speed based on steering angle
         if abs(steer_command) > self.straights_steering_angle:
@@ -336,6 +366,7 @@ class NPGapFollower(Node):
         pred_drive.drive.steering_angle = steer_command   #[-max_steer, max_steer] range
         if not self.train_mode: self.drive_pub.publish(pred_drive)
 
+        #print(f'True Steering: {self.drive_label.drive.steering_angle:.5f}, Predicted Steering: {pred_steer[:, -1, 0].item():.5f}')
         #print(f'Steering Command: {self.drive_label.drive.steering_angle:.5f}, Max Gap Angle: {max_gap_angle:.5f}')
 
         # Log steering rate
@@ -353,28 +384,28 @@ class NPGapFollower(Node):
 
         # End loop timer and report in seconds
         t1 = self.get_clock().now()
-        self.ftg_timer.push_time_pair(t0, t1)
+        if self.log_times:
+            self.ftg_timer.push_time_pair(t0, t1)
+            if self.ftg_timer.should_report():
+                stats = self.ftg_timer.stats()
+                if stats is not None:
+                    mean_dt, std_dt, min_dt, max_dt, hz, n = stats
+                    self.get_logger().info(
+                        f"[FTG LOOP] N={n} | "
+                        f"mean={mean_dt*1000:.3f} ms ± {std_dt*1000:.3f} ms | "
+                        f"min={min_dt*1000:.3f} ms | max={max_dt*1000:.3f} ms | "
+                        f"~{hz:.1f} Hz"
+                    )
 
-        if self.ftg_timer.should_report():
-            stats = self.ftg_timer.stats()
-            if stats is not None:
-                mean_dt, std_dt, min_dt, max_dt, hz, n = stats
-                self.get_logger().info(
-                    f"[FTG LOOP] N={n} | "
-                    f"mean={mean_dt*1000:.3f} ms ± {std_dt*1000:.3f} ms | "
-                    f"min={min_dt*1000:.3f} ms | max={max_dt*1000:.3f} ms | "
-                    f"~{hz:.1f} Hz"
-                )
-
-        if self.cbf_timer.should_report():
-            stats = self.cbf_timer.stats()
-            if stats is not None:
-                mean_dt, std_dt, min_dt, max_dt, hz, n = stats
-                self.get_logger().info(
-                    f"[CBF FILTER] N={n} | "
-                    f"mean={mean_dt*1000:.3f} ms ± {std_dt*1000:.3f} ms | "
-                    f"min={min_dt*1000:.3f} ms | max={max_dt*1000:.3f} ms | "
-                )
+            if self.cbf_timer.should_report():
+                stats = self.cbf_timer.stats()
+                if stats is not None:
+                    mean_dt, std_dt, min_dt, max_dt, hz, n = stats
+                    self.get_logger().info(
+                        f"[CBF FILTER] N={n} | "
+                        f"mean={mean_dt*1000:.3f} ms ± {std_dt*1000:.3f} ms | "
+                        f"min={min_dt*1000:.3f} ms | max={max_dt*1000:.3f} ms | "
+                    )
 
 def main(args=None):
     try:

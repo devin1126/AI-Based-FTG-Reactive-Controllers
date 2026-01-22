@@ -245,3 +245,30 @@ class AttLNP(nn.Module):
 
         # Inference outputs
         return mu, sigma
+    
+
+
+# -----------------------------
+# Prior MLP for control prediction from gap + velocity
+# -----------------------------
+class PriorMLP(nn.Module):
+    def __init__(self, in_dim=4, hidden_dim=96, delta_max=0.6981):
+        super().__init__()
+        self.delta_max = delta_max
+
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln3 = nn.LayerNorm(hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, 1)
+
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        x = self.act(self.ln1(self.fc1(x)))
+        x = self.act(self.ln2(self.fc2(x)))
+        x = self.act(self.ln3(self.fc3(x)))
+        x = torch.tanh(self.fc4(x)) * self.delta_max
+        return x

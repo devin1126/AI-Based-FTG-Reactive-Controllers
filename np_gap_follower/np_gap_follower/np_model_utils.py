@@ -446,8 +446,9 @@ def bin_laser_scans(proc_ranges, num_bins=32, max_range=6.0):
     # Normalize
     binned /= max_range
 
-    # Find max bin and compute its angle
+    # Find max bin/distance and compute its angle
     max_idx = torch.argmax(binned).item()
+    d_max = binned[max_idx]
 
     # Angle calculations (from +135 to -135 degrees)
     fov_rad = np.deg2rad(270)  # 270 degrees
@@ -455,7 +456,7 @@ def bin_laser_scans(proc_ranges, num_bins=32, max_range=6.0):
     angle_left = np.deg2rad(135)
     angle = angle_left - (max_idx + 0.5) * angle_step  # center of bin
 
-    return binned, torch.tensor([-angle], dtype=torch.float32)
+    return binned, torch.tensor([-angle], dtype=torch.float32), d_max
 
 def compute_steering_rate(prev_steer, current_steer, dt=1.0/200.0):
     """
